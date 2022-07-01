@@ -19,7 +19,3 @@ Models tested:
 - xgboost
 - Random Forest
 - MARS
-- 
-
-
-
