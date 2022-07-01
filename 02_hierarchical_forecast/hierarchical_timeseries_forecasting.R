@@ -100,7 +100,6 @@ data_long_tbl <- data_tbl %>%
   # # summarize by time
   group_by(combined) %>%
   summarize_by_time(.date_var = date, .by = "day", value = sum(sales)) %>%
-  mutate(date = as.Date(date)) %>%
   
   # filter out "combined" time series with less than 2 instances
   filter(n() >= 2) %>%

@@ -30,16 +30,18 @@ library(bigrquery)
 # * Pull Data ----
 
 projectid = "source-data-314320"
-sql_Centro <- "SELECT *
+sql <- "SELECT 
+          date,
+          sales
         FROM `source-data-314320.Store_Data.All_Data`
-        WHERE Owner = 'M&D'
-          AND Tienda = 'Centro'
-          AND sales <> 0
+        WHERE owner = 'M&D'
+        AND tienda = 'Centro'
+        AND sales <> 0
         ORDER BY Date desc
 "
 
 # Run the query and store the data in a tibble
-All_Data_Centro <- bq_project_query(projectid, sql_Centro)
+All_Data_Centro <- bq_project_query(projectid, sql)
 BQ_Table_Centro <- bq_table_download(All_Data_Centro)
 
 
@@ -63,7 +65,56 @@ skimr::skim(BQ_Table_Centro)
 
 glimpse(BQ_Table_Centro)
 
-sales_weekly_tbl <- BQ_Table_Centro %>%
+
+
+# Create daily dataset
+sales_daily_tbl <- BQ_Table_Centro %>%
+  
+  summarize_by_time(
+    .date_var = date,
+    .by = "day",
+    sales = sum(sales)
+  ) %>%
+  
+  pad_by_time(
+    .date_var = date,
+    .by = "day",
+    .pad_value = 0)
+
+
+
+
+# * Correct Covid Closure with Lead----
+
+start_date = as.Date('2020-03-01')
+end_date = as.Date('2020-12-31')
+
+
+
+# create new table where covid date data is overwritten with prior year
+sales_daily_covid_tbl <- sales_daily_tbl %>%
+  mutate(date_1 = ymd(sales_daily_tbl$date) + years(1)) %>%
+  mutate(sales_1 = sales) %>%
+  filter(date_1 %within% interval(start_date, end_date)) %>%
+  mutate(date = date_1) %>%
+  mutate(sales = sales_1) %>%
+  select(date, sales)
+
+
+# create new table without covid dates
+sales_daily_drop_tbl <- sales_daily_tbl %>%
+  mutate(date_na = ifelse(date %within% interval(start_date, end_date), NA, date)) %>%
+  drop_na() %>%
+  select(-date_na)
+
+
+# finally, bind rows
+sales_daily_imputed_tbl <- bind_rows(sales_daily_drop_tbl, sales_daily_covid_tbl) %>% arrange(date)
+
+
+
+# Create weekly dataset
+sales_weekly_imputed_tbl <- sales_daily_imputed_tbl %>%
   
   summarize_by_time(
     .date_var = date,
@@ -76,21 +127,11 @@ sales_weekly_tbl <- BQ_Table_Centro %>%
     .by = "week",
     .pad_value = 0) %>%
   
-  filter_by_time(.start_date = "2015-07-19", .end_date = "2022-04-30")
+  filter_by_time(
+    .date_var = date, 
+    .start_date = "2015-07-19", 
+    .end_date = "2022-04-30")
 
-
-# * Correct Covid Closure with Lead----
-
-start_date = as.Date('2020-03-01')
-end_date = as.Date('2020-12-31')
-
-
-sales_weekly_imputed_tbl <- sales_weekly_tbl %>%
-  mutate(sales_na = ifelse(date %within% interval(start_date, end_date), NA, sales)) %>%
-  mutate(sales_lead = lead(sales, n = 52)) %>%
-  mutate(sales = ifelse(is.na(sales_na), sales_lead, sales)) %>%
-  
-  select(date, sales)
 
 
 # * Visualize ----
@@ -114,6 +155,7 @@ sales_weekly_imputed_tbl %>%
 
 
 
+
 # 2.0 TRANSFORMATION ----
 
 # * Log & Standardize Revenue ----
@@ -122,8 +164,8 @@ sales_trans_weekly_tbl <- sales_weekly_imputed_tbl %>%
   mutate(sales = log(sales)) %>%
   mutate(sales = standardize_vec(sales))
 
-std_weekly_mean <- 11.5486420269007
-std_weekly_sd   <- 0.54306056539502
+std_weekly_mean <- 11.5451308641348
+std_weekly_sd   <- 0.53505184655934
 
 
 # * Visualize ----
@@ -304,7 +346,7 @@ workflow_fit_weekly_lm_1_spline <- workflow() %>%
 
 
 workflow_fit_weekly_lm_1_spline %>%
-  pull_workflow_fit() %>%
+  extract_fit_parsnip() %>%
   pluck("fit") %>%
   summary()
 
@@ -335,7 +377,7 @@ workflow_fit_weekly_lm_2_lag <- workflow() %>%
 
 
 workflow_fit_weekly_lm_2_lag %>%
-  pull_workflow_fit() %>%
+  extract_fit_parsnip() %>%
   pluck("fit") %>%
   summary()
 
@@ -379,7 +421,7 @@ calibration_weekly_tbl %>%
 calibration_weekly_tbl %>%
   modeltime_forecast(new_data = testing(weekly_splits),
                      actual_data = prepared_weekly_tbl) %>%
-  plot_modeltime_forecast()
+  plot_modeltime_forecast(.conf_interval_show = FALSE)
 
 
 
