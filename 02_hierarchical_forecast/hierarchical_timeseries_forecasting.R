@@ -68,6 +68,7 @@ sql <- "SELECT
           sales
         FROM `source-data-314320.Store_Data.All_Data`
         WHERE date >= '2020-08-01'
+        AND sales <> 0
         ORDER BY Date desc
 "
 
@@ -83,9 +84,7 @@ data_tbl <- bq_table_download(bq_query)
 
 data_tbl$tienda <- str_replace_all(data_tbl$tienda, "En Linea", "En.Linea")
 
-data_tbl$combined <- str_c(data_tbl$tienda, "_",
-                           data_tbl$metal_type, "_",
-                           data_tbl$product_type)
+data_tbl$combined <- str_c(data_tbl$product_type)
 
 
 
@@ -116,8 +115,8 @@ data_long_tbl %>% skim()
 
 
 # * Split into Centro ----
-data_long_centro_tbl <- data_long_tbl %>% 
-  filter(grepl("Centro", combined))
+data_long_centro_tbl <- data_long_tbl
+  # filter(grepl("Centro", combined))
 
 
 
@@ -178,12 +177,12 @@ full_data_centro_tbl %>% skim()
 
 # * Visualize ----
 
-item_id_sample <- c("Centro_10_Cadena", 
-                    "Centro_14_Cadena",
-                    "Centro_10_Argolla",
-                    "Centro_14_Argolla",
-                    "Centro_10_Anillo",
-                    "Centro_14_Anillo")
+item_id_sample <- c("Cadena", 
+                    "Argolla",
+                    "Anillo",
+                    "Esclava",
+                    "Pulsera",
+                    "Arete")
 
 
 full_data_centro_tbl %>%
@@ -202,7 +201,7 @@ data_prepared_tbl <- full_data_centro_tbl %>%
   filter(!is.na(sales)) %>%
   drop_na()
 
-data_prepared_tbl %>% glimpse()
+data_prepared_tbl
 
 
 
@@ -263,6 +262,15 @@ train_cleaned <- training(splits) %>%
   mutate(sales = ts_clean_vec(sales, period = 7)) %>%
   ungroup()
 
+
+train_cleaned %>%
+  group_by(combined) %>%
+  plot_time_series(
+    date, sales, 
+    .facet_ncol  = 4, 
+    .smooth      = FALSE, 
+    .interactive = FALSE
+  )
 
 
 # * Recipe Specification ----
@@ -605,6 +613,153 @@ calibration_tbl %>%
 # - Helps us strategize an ensemble approach
 
 # * Time Series CV ----
+
+resamples_tscv <- train_cleaned %>%
+  time_series_cv(
+    date_var    = date,
+    assess      = 28,
+    skip        = 28,
+    cumulative  = TRUE,
+    slice_limit = 4
+  )
+
+
+resamples_tscv %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(
+    .date_var = date,
+    .value    = sales
+  )
+
+
+
+# * Fitting Resamples ----
+
+model_tbl_tuned_resamples <- submodels_2_tbl %>%
+  modeltime_fit_resamples(
+    resamples = resamples_tscv,
+    control   = control_resamples(verbose = TRUE, allow_par = TRUE)
+  )
+
+
+
+# * Resampling Accuracy Table ----
+
+model_tbl_tuned_resamples %>%
+  modeltime_resample_accuracy(
+    metric_set  = metric_set(rmse, rsq),
+    summary_fns = list(mean = mean, sd = sd)
+  )
+
+
+
+# * Resampling Accuracy Plot ----
+
+model_tbl_tuned_resamples %>%
+  plot_modeltime_resamples(
+    .metric_set = metric_set(mae, rmse, rsq),
+    .point_size = 4, 
+    .point_alpha = 0.8, 
+    .facet_ncol = 1
+  )
+
+
+
+# 8.0 ENSEMBLE PANEL MODELS ----
+
+# * Average Ensemble ----
+
+submodels_2_ids_to_keep <- c(1, 2, 3, 4)
+
+
+ensemble_fit <- submodels_2_tbl %>%
+  filter(.model_id %in% submodels_2_ids_to_keep) %>%
+  ensemble_average(type = "median")
+
+
+model_ensemble_tbl <- modeltime_table(
+  ensemble_fit
+)
+
+
+# * Accuracy ----
+
+model_ensemble_tbl %>%
+  modeltime_accuracy(testing(splits))
+
+
+# Forecast ----
+
+forecast_ensemble_test_tbl <- model_ensemble_tbl %>%
+  modeltime_forecast(
+    new_data    = testing(splits),
+    actual_data = data_prepared_tbl,
+    keep_data   = TRUE
+  ) %>%
+  mutate(
+    across(.cols = c(.value, sales), .fns = expm1)
+  )
+
+
+forecast_ensemble_test_tbl %>%
+  group_by(combined) %>%
+  filter(combined %in% item_id_sample) %>%
+  filter_by_time(
+    .date_var = date, 
+    .start_date = last(date) %-time% "6 month", 
+    .end_date = "end"
+  ) %>%
+  plot_modeltime_forecast(
+    .facet_ncol = 4,
+    .conf_interval_show = FALSE
+  )
+
+
+forecast_ensemble_test_tbl %>%
+  filter(.key == "prediction") %>%
+  select(combined, .value, sales) %>%
+  # group_by(combined) %>%
+  summarize_accuracy_metrics(
+    truth      = sales,
+    estimate   = .value,
+    metric_set = metric_set(mae, rmse, rsq)
+  )
+
+
+# Refit ----
+
+data_prepared_cleaned_tbl <- data_prepared_tbl %>%
+  group_by(combined) %>%
+  mutate(sales = ts_clean_vec(sales, period = 7)) %>%
+  ungroup()
+
+
+
+model_ensemble_refit_tbl <- model_ensemble_tbl %>%
+  modeltime_refit(data = data_prepared_cleaned_tbl)
+
+
+
+model_ensemble_refit_tbl %>%
+  modeltime_forecast(
+    new_data    = future_tbl,
+    actual_data = data_prepared_tbl,
+    keep_data   = TRUE
+  ) %>%
+  mutate(
+    .value = expm1(.value),
+    sales  = expm1(sales)
+  ) %>%
+  group_by(combined) %>%
+  plot_modeltime_forecast(
+    .y_intercept  = 0,
+    .trelliscope  = TRUE
+  )
+
+
+
+
+
 
 
 
