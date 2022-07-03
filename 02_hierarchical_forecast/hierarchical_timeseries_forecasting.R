@@ -12,6 +12,7 @@
 # Machine Learning
 library(lightgbm)
 library(xgboost)
+library(tictoc)
 
 
 # Tidymodels
@@ -365,7 +366,7 @@ wflw_fit_mars <- workflow() %>%
 # ACCURACY CHECK ----
 
 # Modeltime table
-model_tbl <- modeltime_table(
+submodels_1_tbl <- modeltime_table(
   wflw_fit_prophet,
   wflw_fit_prophet_boost,
   wflw_fit_xgboost,
@@ -375,91 +376,241 @@ model_tbl <- modeltime_table(
 ) 
 
 
-# Calibrate
-calibration_tbl <- model_tbl %>%
-  modeltime_calibrate(new_data = testing(splits))
+submodels_1_tbl %>%
+  modeltime_accuracy(new_data = testing(splits)) %>%
+  arrange(rmse)
 
 
-# accuracy 
-calibration_tbl %>%
-  modeltime_accuracy() %>%
-  table_modeltime_accuracy(
-    .interactive = TRUE,
-    bordered = TRUE,
-    resizable = TRUE
+
+
+
+
+# 5.0 HYPER PARAMETER TUNING ---- 
+
+# * RESAMPLES - K-FOLD ----- 
+
+set.seed(123)
+resamples_kfold <- train_cleaned %>% vfold_cv(v = 5)
+
+resamples_kfold %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(
+    .date_var = date, 
+    .value = sales, 
+    .facet_ncol = 2
   )
 
 
 
-# * Forecast ----
 
-# model forecast on testing(splits)
-test_forecast_tbl <- model_tbl %>%
+# * XGBOOST TUNE ----
+
+# ** Tunable Specification
+
+model_spec_xgboost_tune <- boost_tree(
+  mode           = "regression",
+  mtry           = tune(),
+  trees          = tune(),
+  min_n          = tune(),
+  tree_depth     = tune(),
+  learn_rate     = tune(),
+  loss_reduction = tune()
+) %>%
+  set_engine("xgboost")
+
+
+
+wflw_spec_xgboost_tune <- workflow() %>%
+  add_model(model_spec_xgboost_tune) %>%
+  add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
+
+
+
+# ** Tuning
+
+tic()
+set.seed(123)
+tune_results_xgboost <- wflw_spec_xgboost_tune %>%
+  tune_grid(
+    resamples = resamples_kfold,
+    param_info = parameters(wflw_spec_xgboost_tune) %>%
+      update(
+        learn_rate = learn_rate(range = c(0.001, 0.400), trans = NULL)
+      ),
+    grid = 10,
+    control = control_grid(verbose = TRUE, allow_par = TRUE)
+  )
+toc()
+
+
+# ** Results
+
+tune_results_xgboost %>% show_best("rmse", n = Inf)
+
+
+
+# ** Finalize
+
+wflw_fit_xgboost_tuned <- wflw_spec_xgboost_tune %>%
+  finalize_workflow(select_best(tune_results_xgboost, "rmse")) %>%
+  fit(train_cleaned)
+
+
+
+
+# * RANGER TUNE ----
+
+# ** Tunable Specification
+
+model_spec_rf_tune <- rand_forest(
+  mode  = "regression",
+  mtry  = tune(),
+  trees = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger")
+
+
+wflw_spec_rf_tune <- workflow() %>%
+  add_model(model_spec_rf_tune) %>%
+  add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
+
+# ** Tuning
+
+tic()
+set.seed(123)
+tune_results_rf <- wflw_spec_rf_tune %>%
+  tune_grid(
+    resamples = resamples_kfold,
+    grid      = 5,
+    control   = control_grid(verbose = TRUE, allow_par = TRUE)
+  )
+toc()
+
+
+
+# ** Results
+
+tune_results_rf %>% show_best("rmse", n = Inf)
+
+
+
+# ** Finalize
+
+wflw_fit_rf_tuned <- wflw_spec_rf_tune %>%
+  finalize_workflow(select_best(tune_results_rf, "rmse")) %>%
+  fit(train_cleaned)
+
+
+
+
+
+
+# * EARTH TUNE ----
+
+# ** Tunable Specification
+
+model_spec_earth_tune <- mars(
+  mode        = "regression",
+  num_terms   = tune(),
+  prod_degree = tune()
+) %>%
+  set_engine("earth")
+
+
+wflw_spec_earth_tune <- workflow() %>%
+  add_model(model_spec_earth_tune) %>%
+  add_recipe(recipe_spec %>% update_role(date, new_role = "indicator"))
+
+
+
+# ** Tuning
+
+tic()
+set.seed(123)
+tune_results_earth <- wflw_spec_earth_tune %>%
+  tune_grid(
+    resamples = resamples_kfold,
+    grid      = 10,
+    control   = control_grid(verbose = TRUE, allow_par = TRUE)
+  )
+toc()
+
+
+
+# ** Results
+
+tune_results_earth %>% show_best("rmse")
+
+
+# ** Finalize
+wflw_fit_earth_tuned <- wflw_spec_earth_tune %>%
+  finalize_workflow(tune_results_earth %>% select_best("rmse")) %>%
+  fit(train_cleaned)
+
+
+
+
+
+# 6.0 EVALUATE PANEL FORECASTS  -----
+
+# * Model Table ----
+
+submodels_2_tbl <- modeltime_table(
+  wflw_fit_xgboost_tuned,
+  wflw_fit_rf_tuned,
+  wflw_fit_earth_tuned
+) %>%
+  update_model_description(1, "xgboost - tuned") %>%
+  update_model_description(2, "ranger - tuned") %>%
+  update_model_description(3, "earth - tuned") %>%
+  combine_modeltime_tables(submodels_1_tbl)
+
+
+
+# * Calibration ----
+calibration_tbl <- submodels_2_tbl %>%
+  modeltime_calibrate(testing(splits))
+
+
+
+# * Accuracy ----
+calibration_tbl %>%
+  modeltime_accuracy() %>%
+  arrange(rmse)
+
+
+
+# * Forecast Test ----
+
+calibration_tbl %>%
   modeltime_forecast(
     new_data    = testing(splits),
     actual_data = data_prepared_tbl,
-    keep_data   = TRUE 
-  )
-
-
-# Visualize Actual vs Test
-
-test_forecast_tbl %>%
-  
-  # FILTER IDENTIFIERS
-  filter(combined %in% item_id_sample) %>%
-  
-  group_by(combined) %>%
-  
-  # Focus on end of series
-  filter_by_time(
-    .date_var = date,
-    .start_date = last(date) %-time% "3 month",
-    .end_date = "end"
-  ) %>%
-  
-  plot_modeltime_forecast(
-    .conf_interval_show = FALSE, 
-    .smooth = FALSE, 
-    .facet_ncol = 2, 
-    .interactive = TRUE
-  )
-
-
-
-# * Refit ----
-
-data_prepared_tbl_cleaned <- data_prepared_tbl %>%
-  group_by(combined) %>%
-  mutate(sales = ts_clean_vec(sales, period = 7)) %>%
-  ungroup()
-
-
-
-model_refit_tbl <- model_tbl %>%
-  modeltime_refit(data = data_prepared_tbl_cleaned)
-
-
-
-forecast_future_tbl <- calibration_tbl %>%
-  modeltime_forecast(
-    new_data    = future_tbl,
-    actual_data = data_prepared_tbl,
     keep_data   = TRUE
   ) %>%
-  mutate(
-    .value    = expm1(.value),
-    sales = expm1(sales))
-  
-
-
-forecast_future_tbl %>% 
-  filter(combined %in% item_id_sample) %>%
   group_by(combined) %>%
-  
   plot_modeltime_forecast(
-    .facet_ncol = 3,
-    .conf_interval_show = FALSE)
+    .conf_interval_show = FALSE,
+    .trelliscope        = TRUE
+  )
+
+
+
+
+# 7.0 RESAMPLING ----
+# - Assess the stability of our models over time
+# - Helps us strategize an ensemble approach
+
+# * Time Series CV ----
+
+
+
+
+
+
 
 
 
