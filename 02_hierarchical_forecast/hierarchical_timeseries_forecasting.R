@@ -67,8 +67,7 @@ sql <- "SELECT
           product_type,
           sales
         FROM `source-data-314320.Store_Data.All_Data`
-        WHERE date >= '2020-08-01'
-        AND sales <> 0
+        WHERE sales <> 0
         ORDER BY Date desc
 "
 
@@ -755,14 +754,6 @@ model_ensemble_refit_tbl %>%
     .y_intercept  = 0,
     .trelliscope  = TRUE
   )
-
-
-
-
-
-
-
-
 
 
 
